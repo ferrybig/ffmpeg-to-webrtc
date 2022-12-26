@@ -7,10 +7,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/atotto/clipboard"
+	"github.com/gorilla/mux"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/pion/webrtc/v3/pkg/media/h264reader"
@@ -20,7 +22,12 @@ const (
 	h264FrameDuration = time.Millisecond * 33
 )
 
-func main() { //nolint
+var globalConnectionId = 0
+
+func setupConnection(browserOffer string) (string, error) {
+	globalConnectionId++
+	connectionId := globalConnectionId
+	fmt.Printf("[%d] Starting new session...\n", connectionId)
 	// Create a new RTCPeerConnection
 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -30,25 +37,28 @@ func main() { //nolint
 		},
 	})
 	if err != nil {
-		panic(err)
+		return "", err
 	}
-	defer func() {
-		if cErr := peerConnection.Close(); cErr != nil {
-			fmt.Printf("cannot close peerConnection: %v\n", cErr)
-		}
-	}()
 
 	iceConnectedCtx, iceConnectedCtxCancel := context.WithCancel(context.Background())
 
 	// Create a video track
 	videoTrack, videoTrackErr := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion")
 	if videoTrackErr != nil {
-		panic(videoTrackErr)
+		if cErr := peerConnection.Close(); cErr != nil {
+			fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+		}
+		iceConnectedCtxCancel()
+		return "", videoTrackErr
 	}
 
 	rtpSender, videoTrackErr := peerConnection.AddTrack(videoTrack)
 	if videoTrackErr != nil {
-		panic(videoTrackErr)
+		if cErr := peerConnection.Close(); cErr != nil {
+			fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+		}
+		iceConnectedCtxCancel()
+		return "", videoTrackErr
 	}
 
 	// Read incoming RTCP packets
@@ -67,12 +77,20 @@ func main() { //nolint
 		dataPipe, err := RunCommand("ffmpeg", os.Args[1:]...)
 
 		if err != nil {
-			panic(err)
+			fmt.Printf("[%d] datapipe err: %v\n", connectionId, err)
+			if cErr := peerConnection.Close(); cErr != nil {
+				fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+			}
+			return
 		}
 
 		h264, h264Err := h264reader.NewReader(dataPipe)
 		if h264Err != nil {
-			panic(h264Err)
+			fmt.Printf("[%d] h264Err: %v\n", connectionId, h264Err)
+			if cErr := peerConnection.Close(); cErr != nil {
+				fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+			}
+			return
 		}
 
 		// Wait for connection established
@@ -89,11 +107,24 @@ func main() { //nolint
 		for ; true; <-ticker.C {
 			nal, h264Err := h264.NextNAL()
 			if h264Err == io.EOF {
-				fmt.Printf("All video frames parsed and sent")
-				os.Exit(0)
+				fmt.Printf("[%d] All video frames parsed and sent\n", connectionId)
+				if cErr := peerConnection.Close(); cErr != nil {
+					fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+				}
+				if cErr := dataPipe.Close(); cErr != nil {
+					fmt.Printf("[%d] cannot close dataPipe: %v\n", connectionId, cErr)
+				}
+				return
 			}
 			if h264Err != nil {
-				panic(h264Err)
+				fmt.Printf("[%d] h264Err: %v\n", connectionId, h264Err)
+				if cErr := peerConnection.Close(); cErr != nil {
+					fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+				}
+				if cErr := dataPipe.Close(); cErr != nil {
+					fmt.Printf("[%d] cannot close dataPipe: %v\n", connectionId, cErr)
+				}
+				return
 			}
 
 			nal.Data = append([]byte{0x00, 0x00, 0x00, 0x01}, nal.Data...)
@@ -107,7 +138,14 @@ func main() { //nolint
 			}
 
 			if h264Err = videoTrack.WriteSample(media.Sample{Data: nal.Data, Duration: time.Second}); h264Err != nil {
-				panic(h264Err)
+				fmt.Printf("[%d] h264Err: %v\n", connectionId, h264Err)
+				if cErr := peerConnection.Close(); cErr != nil {
+					fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+				}
+				if cErr := dataPipe.Close(); cErr != nil {
+					fmt.Printf("[%d] cannot close dataPipe: %v\n", connectionId, cErr)
+				}
+				return
 			}
 		}
 	}()
@@ -115,7 +153,7 @@ func main() { //nolint
 	// Set the handler for ICE connection state
 	// This will notify you when the peer has connected/disconnected
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		fmt.Printf("Connection State has changed %s \n", connectionState.String())
+		fmt.Printf("[%d] Connection State has changed %s\n", connectionId, connectionState.String())
 		if connectionState == webrtc.ICEConnectionStateConnected {
 			iceConnectedCtxCancel()
 		}
@@ -124,38 +162,49 @@ func main() { //nolint
 	// Set the handler for Peer connection state
 	// This will notify you when the peer has connected/disconnected
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
+		fmt.Printf("[%d] Peer Connection State has changed: %s\n", connectionId, s.String())
 
 		if s == webrtc.PeerConnectionStateFailed {
 			// Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
 			// Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
 			// Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
-			fmt.Println("Peer Connection has gone to failed exiting")
-			os.Exit(0)
+			fmt.Printf("[%d] Exiting...", connectionId)
+
+			if cErr := peerConnection.Close(); cErr != nil {
+				fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+			}
 		}
 	})
 
-	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
-	Decode(MustReadStdin(), &offer)
+	offer.Type = webrtc.SDPTypeOffer
+	offer.SDP = browserOffer
 
-	// Set the remote SessionDescription
+	fmt.Printf("[%d] Reading offer...\n%s\n", connectionId, browserOffer)
 	if err = peerConnection.SetRemoteDescription(offer); err != nil {
-		panic(err)
+		if cErr := peerConnection.Close(); cErr != nil {
+			fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+		}
+		return "", err
 	}
 
-	// Create answer
+	fmt.Printf("[%d] Creating answer...\n", connectionId)
 	answer, err := peerConnection.CreateAnswer(nil)
 	if err != nil {
-		panic(err)
+		if cErr := peerConnection.Close(); cErr != nil {
+			fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+		}
+		return "", err
 	}
 
-	// Create channel that is blocked until ICE Gathering is complete
 	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 
-	// Sets the LocalDescription, and starts our UDP listeners
+	fmt.Printf("[%d] Setting local description...\n", connectionId)
 	if err = peerConnection.SetLocalDescription(answer); err != nil {
-		panic(err)
+		if cErr := peerConnection.Close(); cErr != nil {
+			fmt.Printf("[%d] cannot close peerConnection: %v\n", connectionId, cErr)
+		}
+		return "", err
 	}
 
 	// Block until ICE Gathering is complete, disabling trickle ICE
@@ -163,11 +212,37 @@ func main() { //nolint
 	// in a production application you should exchange ICE Candidates via OnICECandidate
 	<-gatherComplete
 
-	// Output the answer in base64 so we can paste it in browser
-	sdp := Encode(*peerConnection.LocalDescription())
-	fmt.Println(sdp)
-	clipboard.WriteAll(sdp)
+	fmt.Printf("[%d] Sending local description...\n", connectionId)
+	sdp := *peerConnection.LocalDescription()
+	return sdp.SDP, nil
+}
 
-	// Block forever
-	select {}
+func main() {
+	fmt.Printf("Starting...\n")
+	r := mux.NewRouter()
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("content-type") == "application/sdp" {
+			buf := new(strings.Builder)
+			if _, err := io.Copy(buf, r.Body); err != nil {
+				http.Error(w, "Error1: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			sdpOffer := buf.String()
+			sdpAnswer, err := setupConnection(sdpOffer)
+			if err != nil {
+				http.Error(w, "Error2: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			fmt.Printf(sdpAnswer)
+			w.Header().Set("Content-Type", "application/sdp")
+			w.Write([]byte(sdpAnswer))
+			return
+		}
+		http.Error(w, "Unaceptable", http.StatusUnsupportedMediaType)
+	}).Methods("POST")
+
+	fmt.Printf("Listening on: http://[::]:5050/\n")
+	http.ListenAndServe("[::]:5050", r)
+
 }
